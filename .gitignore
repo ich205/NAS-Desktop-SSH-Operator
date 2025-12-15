@@ -1,0 +1,44 @@
+# ------------------------------------------------------------
+# Repo Hygiene (NAS-Desktop-SSH-Operator)
+# Prevent accidental commits of generated / local-only files.
+# ------------------------------------------------------------
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Build artifacts ---
+build/
+dist/
+*.egg-info/
+
+# --- OS / Editor junk ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --- PatchPilot local state (MUST NOT be committed) ---
+.patchpilot/
+
+# --- Patch files are local workflow artifacts (don’t commit) ---
+*.patch
+*.diff
+*.rej
+
+# --- Local databases / logs (if they ever appear in-repo) ---
+*.sqlite
+*.sqlite3
+*.log
+
