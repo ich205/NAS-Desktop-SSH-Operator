@@ -1,0 +1,415 @@
+--- a/NAS-Desktop-SSH-Operator/src/jfo/infra/sqlite_index.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/infra/sqlite_index.py
+@@ -126,6 +126,46 @@
+                 (root, limit),
+             )
+         return [r[0] for r in cur.fetchall()]
++    finally:
++        conn.close()
++
++
++def search_dirs_for_root(root: str, term: str, *, limit: int = 200) -> List[str]:
++    """Search distinct directories for a given root marker.
++
++    This is used for UI pickers (Move/Swap/etc.) to quickly choose a folder
++    based on a substring match.
++    """
++    init_db()
++    conn = connect()
++    try:
++        like = "%" + term + "%"
++        cur = conn.execute(
++            "SELECT DISTINCT dir FROM files WHERE root=? AND (dir LIKE ? OR path LIKE ?) "
++            "ORDER BY dir LIMIT ?",
++            (root, like, like, limit),
++        )
++        return [r[0] for r in cur.fetchall()]
++    finally:
++        conn.close()
++
++
++def search_dirs_any_root(term: str, *, limit: int = 200) -> List[Tuple[str, str]]:
++    """Search distinct directories across all roots.
++
++    Returns:
++        List of (dir, root)
++    """
++    init_db()
++    conn = connect()
++    try:
++        like = "%" + term + "%"
++        cur = conn.execute(
++            "SELECT DISTINCT dir, root FROM files WHERE (dir LIKE ? OR path LIKE ?) "
++            "ORDER BY dir LIMIT ?",
++            (like, like, limit),
++        )
++        return [(r[0], r[1]) for r in cur.fetchall()]
++    finally:
++        conn.close()
+ 
+ 
+ def search_files_for_root(
+     root: str,
+     term: str,
+@@ -171,6 +211,7 @@
+     finally:
+         conn.close()
+ 
++
+ def search_files_any_root(
+     term: str,
+     *,
+     exts: Optional[Sequence[str]] = None,
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/dialogs.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/dialogs.py
+@@ -8,9 +8,10 @@
+ import threading
+ from pathlib import PurePosixPath
+ from typing import Callable, Optional
+ 
+ from jfo.core.validators import Sandbox, SandboxViolation
+ from jfo.infra.remote_fs import Mountpoint, list_mountpoints, list_directories, normalize_posix_path, parent_dir
++from jfo.infra.sqlite_index import distinct_roots, search_dirs_any_root, search_dirs_for_root
+ 
+ 
+ def ask_trust_hostkey(master: tk.Misc, host_id: str, fingerprint: str) -> bool:
+     msg = (
+@@ -291,6 +292,214 @@
+     dlg.wait_window()
+     return result["path"]
+ 
++
++def pick_index_directory(
++    master: tk.Misc,
++    *,
++    allowed_roots: list[str],
++    title: str = "Ordner aus Analyse-Index wählen",
++    initial_term: str = "",
++    allow_set_allowed_root: bool = False,
++    on_allowed_roots_updated: Callable[[list[str]], None] | None = None,
++) -> str | None:
++    """Pick a remote directory path from the local analysis index (SQLite).
++
++    This does **not** touch the NAS. It's a fast local search over the last scan results.
++
++    Safety:
++    - Enforces the configured allowed roots (sandbox).
++    - Optionally allows adding the selected directory as an allowed root.
++    """
++    if not allowed_roots:
++        messagebox.showwarning(
++            "Allowed Roots",
++            "Bitte zuerst im Tab 'Main' mindestens einen Allowed Root setzen (Root-Sandbox).\n\n"
++            "Tipp: Nutze dort den Browse-Dialog und füge z.B. '/volume2/Media' hinzu.",
++            parent=master,
++        )
++        return None
++
++    sandbox = Sandbox(allowed_roots)
++
++    dlg = tk.Toplevel(master)
++    dlg.title(title)
++    dlg.geometry("750x520")
++    dlg.transient(master)
++    dlg.grab_set()
++
++    result: dict[str, str | None] = {"path": None}
++
++    # ---- Root filter + search ----
++    top = ttk.Frame(dlg)
++    top.pack(fill=tk.X, padx=10, pady=10)
++
++    ttk.Label(top, text="Analyse Root (optional):").grid(row=0, column=0, sticky="w")
++    root_var = tk.StringVar(value="")
++    root_combo = ttk.Combobox(top, textvariable=root_var, values=[""], state="readonly", width=60)
++    root_combo.grid(row=0, column=1, sticky="we", padx=(6, 6))
++
++    def _refresh_roots() -> None:
++        roots = distinct_roots(limit=500)
++        values = [""] + roots
++        root_combo["values"] = values
++        if root_var.get() not in values:
++            root_var.set("")
++
++    ttk.Button(top, text="Aktualisieren", command=_refresh_roots).grid(row=0, column=2)
++
++    ttk.Label(top, text="Suchbegriff (Ordner):").grid(row=1, column=0, sticky="w", pady=(10, 0))
++    term_var = tk.StringVar(value=initial_term)
++    term_entry = ttk.Entry(top, textvariable=term_var)
++    term_entry.grid(row=1, column=1, sticky="we", padx=(6, 6), pady=(10, 0))
++
++    top.columnconfigure(1, weight=1)
++
++    # ---- Results ----
++    mid = ttk.Frame(dlg)
++    mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
++
++    lst = tk.Listbox(mid, height=18)
++    ysb = ttk.Scrollbar(mid, orient="vertical", command=lst.yview)
++    lst.configure(yscrollcommand=ysb.set)
++    lst.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
++    ysb.pack(side=tk.RIGHT, fill=tk.Y)
++
++    rows: list[tuple[str, str]] = []  # (dir, root)
++
++    def _set_rows(new_rows: list[tuple[str, str]]) -> None:
++        nonlocal rows
++        rows = new_rows
++        lst.delete(0, tk.END)
++        for d, r in rows:
++            prefix = f"[{r}] " if r else ""
++            lst.insert(tk.END, prefix + d)
++
++    # ---- Optional: allow adding as root ----
++    opt = ttk.Frame(dlg)
++    opt.pack(fill=tk.X, padx=10, pady=(0, 6))
++
++    add_as_root = tk.BooleanVar(value=False)
++    if allow_set_allowed_root:
++        ttk.Checkbutton(
++            opt,
++            text="Auswahl als Allowed Root hinzufügen (Root-Sandbox)",
++            variable=add_as_root,
++        ).pack(side=tk.LEFT)
++
++    status = tk.StringVar(value="")
++    ttk.Label(opt, textvariable=status).pack(side=tk.RIGHT)
++
++    def _do_search() -> None:
++        term = term_var.get().strip()
++        if not term:
++            messagebox.showinfo("Suche", "Bitte Suchbegriff eingeben.", parent=dlg)
++            return
++
++        status.set("Suche…")
++        lst.delete(0, tk.END)
++
++        def _worker() -> None:
++            try:
++                r = root_var.get().strip()
++                if r:
++                    dirs = search_dirs_for_root(r, term, limit=300)
++                    hits = [(d, r) for d in dirs]
++                else:
++                    hits = search_dirs_any_root(term, limit=300)
++                dlg.after(0, lambda: _set_rows(hits))
++                dlg.after(0, lambda: status.set(f"{len(hits)} Treffer"))
++            except Exception as exc:  # noqa: BLE001
++                dlg.after(0, lambda: status.set("Fehler"))
++                dlg.after(0, lambda: messagebox.showerror("Suche", str(exc), parent=dlg))
++
++        threading.Thread(target=_worker, daemon=True).start()
++
++    ttk.Button(top, text="Suchen", command=_do_search).grid(row=1, column=2, pady=(10, 0))
++
++    # ---- Confirm / cancel ----
++    btns = ttk.Frame(dlg)
++    btns.pack(fill=tk.X, padx=10, pady=10)
++
++    def _confirm() -> None:
++        sel = lst.curselection()
++        if not sel:
++            messagebox.showinfo("Auswahl", "Bitte einen Ordner auswählen.", parent=dlg)
++            return
++        idx = int(sel[0])
++        if idx < 0 or idx >= len(rows):
++            return
++        chosen_dir, _r = rows[idx]
++
++        # Sandbox check (or optionally add as root)
++        try:
++            sandbox.assert_path_allowed(chosen_dir)
++        except SandboxViolation as exc:
++            if allow_set_allowed_root and add_as_root.get():
++                allowed_roots.append(chosen_dir.rstrip("/") + "/")
++                if on_allowed_roots_updated:
++                    on_allowed_roots_updated(list(allowed_roots))
++            else:
++                messagebox.showerror(
++                    "Sandbox",
++                    f"{exc}\n\n"
++                    "Wenn du diesen Pfad zulassen möchtest, füge ihn als Allowed Root hinzu.",
++                    parent=dlg,
++                )
++                return
++
++        result["path"] = chosen_dir
++        dlg.destroy()
++
++    def _cancel() -> None:
++        dlg.destroy()
++
++    ttk.Button(btns, text="Übernehmen", command=_confirm).pack(side=tk.LEFT)
++    ttk.Button(btns, text="Abbrechen", command=_cancel).pack(side=tk.LEFT, padx=8)
++
++    lst.bind("<Double-Button-1>", lambda _e: _confirm())
++    term_entry.bind("<Return>", lambda _e: _do_search())
++
++    _refresh_roots()
++    term_entry.focus_set()
++
++    dlg.wait_window()
++    return result["path"]
++
+ 
+ def ask_execute_with_dry_run(master: tk.Misc, *, ops_count: int) -> str | None:
+     """Ask the user how to execute when Dry-Run is enabled.
+ 
+     Returns:
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_move.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_move.py
+@@ -13,7 +13,7 @@
+ from jfo.infra.journal import append_journal
+ from jfo.infra.index_update import apply_plan_to_index
+ from jfo.infra.sqlite_index import files_under_dir_recursive
+-from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, ask_execute_with_dry_run
++from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, pick_index_directory, ask_execute_with_dry_run
+ from jfo.ui.widgets import LabeledEntry, ReadonlyText, LogText, PlanTable
+ 
+ 
+ class MoveTab(ttk.Frame):
+@@ -33,11 +33,13 @@
+         src_row = ttk.Frame(in_frm)
+         src_row.pack(fill=tk.X, pady=2)
+         self.src_entry = LabeledEntry(src_row, "Quelle (remote dir):", width=80)
+         self.src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(src_row, text="Browse…", command=lambda: self._browse_into(self.src_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(src_row, text="Index…", command=lambda: self._index_into(self.src_entry)).pack(side=tk.LEFT, padx=6)
+ 
+         dst_row = ttk.Frame(in_frm)
+         dst_row.pack(fill=tk.X, pady=2)
+         self.dst_entry = LabeledEntry(dst_row, "Ziel (remote dir):", width=80)
+         self.dst_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(dst_row, text="Browse…", command=lambda: self._browse_into(self.dst_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(dst_row, text="Index…", command=lambda: self._index_into(self.dst_entry)).pack(side=tk.LEFT, padx=6)
+@@ -103,6 +105,18 @@
+         if chosen:
+             entry.set(chosen)
+ 
++    def _index_into(self, entry: LabeledEntry) -> None:
++        chosen = pick_index_directory(
++            self,
++            allowed_roots=self.app.settings.allowed_roots,
++            title="Ordner aus Analyse-Index wählen",
++            allow_set_allowed_root=True,
++            on_allowed_roots_updated=self._allowed_roots_updated,
++        )
++        if chosen:
++            entry.set(chosen)
++
+     def _build_plan(self) -> None:
+         src = self.src_entry.get()
+         dst = self.dst_entry.get()
+         if not src or not dst:
+             messagebox.showwarning("Eingabe", "Quelle und Ziel müssen gesetzt sein.", parent=self)
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_swap.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_swap.py
+@@ -22,7 +22,7 @@
+ from jfo.infra.journal import append_journal
+ from jfo.infra.index_update import apply_plan_to_index
+ from jfo.infra.sqlite_index import files_under_dir_recursive
+-from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, ask_execute_with_dry_run
++from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, pick_index_directory, ask_execute_with_dry_run
+ from jfo.ui.widgets import LabeledEntry, ReadonlyText, LogText, PlanTable
+ 
+ 
+ class SwapTab(ttk.Frame):
+@@ -64,11 +64,13 @@
+         row_a = ttk.Frame(in_frm)
+         row_a.pack(fill=tk.X, pady=2)
+         self.a_entry = LabeledEntry(row_a, "Ordner A:", width=80)
+         self.a_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(row_a, text="Browse…", command=lambda: self._browse_into(self.a_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(row_a, text="Index…", command=lambda: self._index_into(self.a_entry)).pack(side=tk.LEFT, padx=6)
+ 
+         row_b = ttk.Frame(in_frm)
+         row_b.pack(fill=tk.X, pady=2)
+         self.b_entry = LabeledEntry(row_b, "Ordner B:", width=80)
+         self.b_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(row_b, text="Browse…", command=lambda: self._browse_into(self.b_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(row_b, text="Index…", command=lambda: self._index_into(self.b_entry)).pack(side=tk.LEFT, padx=6)
+@@ -220,6 +222,18 @@
+         if chosen:
+             entry.set(chosen)
+ 
++    def _index_into(self, entry: LabeledEntry) -> None:
++        chosen = pick_index_directory(
++            self,
++            allowed_roots=self.app.settings.allowed_roots,
++            title="Ordner aus Analyse-Index wählen",
++            allow_set_allowed_root=True,
++            on_allowed_roots_updated=self._allowed_roots_updated,
++        )
++        if chosen:
++            entry.set(chosen)
++
+     def _list_files_best_effort(self, folder: str) -> list[str]:
+         """Try to list files (video+sidecars) in a folder to help the user choose operations."""
+         try:
+             exts = set([e.lower().lstrip(".") for e in (self.app.settings.video_exts + self.app.settings.sidecar_exts)])
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_rename.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_rename.py
+@@ -871,10 +871,11 @@
+                 self.log.append_line("[local] cancelled (dry-run dialog)")
+                 return
+             if choice == "real":
+                 self.dry_run.set(False)
+                 self._update_execute_label()
+                 self._regen_script()
+                 self.log.append_line("[local] executing REAL run (Dry-Run disabled)")
+             else:
+                 self.log.append_line("[local] executing TEST run (Dry-Run enabled)")
+-        if n >= self.app.settings.mass_confirm_threshold:
++        # Mass-confirm only for real runs.
++        if (not bool(self.dry_run.get())) and n >= self.app.settings.mass_confirm_threshold:
+             if not ask_text_confirm(self, "Mass-Confirm", f"Du bist dabei {n} Operationen auszuführen.", "JA"):
+                 self.log.append_line("[local] cancelled by mass-confirm")
+                 return
+         self.log.append_line("[local] executing script...")
+         t = threading.Thread(target=self._worker_exec, daemon=True)
+         t.start()
+--- a/NAS-Desktop-SSH-Operator/README.md
++++ b/NAS-Desktop-SSH-Operator/README.md
+@@ -86,7 +86,9 @@
+ ### Tab 4: Verschieben
+ 
+ - Quelle und Ziel (remote)
++  - **Browse…**: NAS Ordner-Browser
++  - **Index…**: Suche im lokalen Analyse-Index (schnell, ohne NAS-Zugriff)
+ - Optionen: Skip wenn Ziel existiert / Suffix-Strategie
+ - Plan erstellt `mv`-Operationen
+ - Ausführen führt Script aus
+ 
+@@ -139,6 +141,26 @@
+ - Plan erstellt `mkdir` + `ln`/`cp` Operationen
+ - Script prüft pro Link:
+   - Quelle/Ziel in erlaubten Roots
+   - Ziel existiert nicht (standard)
+   - Quelle/Ziel auf gleichem Dateisystem (Device-ID via `stat`)
+ 
++### Tab 7: History / Undo
++
++- Zeigt die letzten Ausführungen (Journal JSONL) inkl. Script + Exitcode + stdout/stderr
++- Pro Eintrag kann ein **Undo-Plan** erzeugt werden (sofern möglich):
++  - `mv` wird invertiert (zurück verschieben)
++  - `rename` wird invertiert (zurück benennen)
++  - `mkdir` wird **nicht** automatisch entfernt (konservativ)
++  - `ln` wird (optional) als `rm`-Undo angeboten (standard: deaktiviert)
++
++### Tab 8: Tauschen (Swap)
++
++- Tauscht die Namen von **zwei Film-Ordnern** (inkl. Dateien) sicher:
++  - nutzt temporären Ordnernamen, um Kollisionen zu vermeiden
++  - optional: Dateinamen im Ordner passend zum Ziel-Ordnernamen mit tauschen
++- Auch hier: Plan → Preview → Script → Ausführen (Dry-Run default)
++
+ ---
+ 
+ ## Sicherheit / Guardrails (Wichtig)
+@@ -146,7 +168,8 @@
+ - **Dry-Run**: Standard `DRY_RUN=1` → Script schreibt nur vor, führt aber nicht aus.
++  - Wenn du im GUI auf **Ausführen** klickst während Dry-Run aktiv ist, fragt JFO nach: **Testlauf** oder **Echtlauf**.
+ - **No Overwrite**: existierende Ziele werden standardmäßig als Fehler behandelt.
+ - **Root-Sandbox**: jede Operation muss innerhalb der konfigurierten Roots liegen.
+ - **Mass-Confirm**: ab `N` Operationen muss zusätzlich "JA" getippt werden.
+ - **Journal**: jede Ausführung wird als JSONL in `.../JellyfinOrganizer/journal.jsonl` gespeichert.

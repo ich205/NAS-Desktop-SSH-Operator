@@ -1,0 +1,358 @@
+﻿--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/dialogs.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/dialogs.py
+@@ -378,3 +378,188 @@
+ 
+     dlg.wait_window()
+     return result["mode"]
++
++
++def pick_from_analysis_index(
++    master: tk.Misc,
++    *,
++    title: str = "Aus Analyse auswählen",
++    mode: str = "dir",
++    initial_term: str = "",
++) -> str | None:
++    """Pick a directory or file path from the local analysis index (SQLite).
++
++    Rationale:
++      - Path typos are a major source of errors.
++      - After scanning (Analyse-Tab) the user should be able to *search* for a movie/folder
++        and reuse the exact path in other tabs (Move/Swap/Hardlinks/etc.).
++
++    Args:
++      mode:
++        - "dir": return a directory path (default)
++        - "file": return a file path
++
++    Returns:
++      The selected path (POSIX) or None if cancelled / no selection.
++    """
++    from jfo.infra import sqlite_index  # local import to keep startup snappy
++
++    if mode not in ("dir", "file"):
++        raise ValueError("mode must be 'dir' or 'file'")
++
++    dlg = tk.Toplevel(master)
++    dlg.title(title)
++    dlg.geometry("920x520")
++    dlg.transient(master)
++    try:
++        dlg.grab_set()
++    except Exception:
++        pass
++    dlg.resizable(True, True)
++
++    result: dict[str, str | None] = {"value": None}
++
++    # ---- Header / controls ----
++    top = ttk.Frame(dlg)
++    top.pack(fill=tk.X, padx=10, pady=10)
++
++    roots = [""] + (sqlite_index.distinct_roots(limit=200) or [])
++    root_var = tk.StringVar(value="")
++    ttk.Label(top, text="Analyse Root:").pack(side=tk.LEFT)
++    root_cb = ttk.Combobox(top, textvariable=root_var, values=roots, width=45, state="readonly")
++    root_cb.pack(side=tk.LEFT, padx=(6, 16))
++
++    term_var = tk.StringVar(value=(initial_term or "").strip())
++    ttk.Label(top, text="Suche:").pack(side=tk.LEFT)
++    term_entry = ttk.Entry(top, textvariable=term_var)
++    term_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
++
++    # ---- Results ----
++    mid = ttk.Frame(dlg)
++    mid.pack(fill=tk.BOTH, expand=True, padx=10)
++
++    if mode == "dir":
++        cols = ("dir", "root")
++        tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
++        tree.heading("dir", text="Ordner")
++        tree.heading("root", text="Root")
++        tree.column("dir", width=680, anchor=tk.W)
++        tree.column("root", width=200, anchor=tk.W)
++    else:
++        cols = ("path", "root", "ext")
++        tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
++        tree.heading("path", text="Datei")
++        tree.heading("root", text="Root")
++        tree.heading("ext", text="Ext")
++        tree.column("path", width=660, anchor=tk.W)
++        tree.column("root", width=180, anchor=tk.W)
++        tree.column("ext", width=50, anchor=tk.W)
++
++    ysb = ttk.Scrollbar(mid, orient=tk.VERTICAL, command=tree.yview)
++    tree.configure(yscroll=ysb.set)
++    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
++    ysb.pack(side=tk.RIGHT, fill=tk.Y)
++
++    status = ttk.Label(dlg, text="Tippe einen Suchbegriff (z. B. 'Furious').")
++    status.pack(fill=tk.X, padx=10, pady=(6, 0))
++
++    # Map row iid -> value
++    iid_map: dict[str, str] = {}
++
++    def _clear_tree() -> None:
++        for iid in tree.get_children():
++            tree.delete(iid)
++        iid_map.clear()
++
++    def _populate() -> None:
++        _clear_tree()
++        root = root_var.get().strip() or None
++        term = term_var.get().strip()
++        if not term:
++            # Too many entries otherwise.
++            if root and mode == "dir":
++                dirs = sqlite_index.distinct_dirs_for_root(root, prefix="", limit=250)
++                for d in dirs:
++                    iid = tree.insert("", tk.END, values=(d, root))
++                    iid_map[iid] = d
++                status.config(text=f"{len(dirs)} Ordner (Root='{root}'). Tipp: Suche eingeben für bessere Treffer.")
++            else:
++                status.config(text="Bitte Suchbegriff eingeben (oder Root setzen).")
++            return
++
++        # Run query: use file search to allow substring matches, then derive unique dirs
++        if root:
++            hits = sqlite_index.search_files_for_root(root, term, limit=600)
++        else:
++            hits = sqlite_index.search_files_any_root(term, limit=600)
++
++        if mode == "dir":
++            seen: set[tuple[str, str]] = set()
++            rows: list[tuple[str, str]] = []
++            for _path, d, _name, _ext, r in hits:
++                key = (d, r)
++                if key not in seen:
++                    seen.add(key)
++                    rows.append(key)
++            rows.sort()
++            for d, r in rows[:500]:
++                iid = tree.insert("", tk.END, values=(d, r))
++                iid_map[iid] = d
++            status.config(text=f"{len(rows)} Treffer (zeige {min(len(rows), 500)}).")
++        else:
++            for p, _d, _name, ext, r in hits[:500]:
++                iid = tree.insert("", tk.END, values=(p, r, ext))
++                iid_map[iid] = p
++            status.config(text=f"{len(hits)} Treffer (zeige {min(len(hits), 500)}).")
++
++    # Debounce to avoid hammering SQLite while typing
++    _job: dict[str, str | None] = {"id": None}
++
++    def _schedule_refresh(*_args) -> None:
++        if _job["id"]:
++            try:
++                dlg.after_cancel(_job["id"])
++            except Exception:
++                pass
++        _job["id"] = dlg.after(220, _populate)
++
++    def _accept() -> None:
++        sel = tree.selection()
++        if not sel:
++            return
++        iid = sel[0]
++        result["value"] = iid_map.get(iid)
++        try:
++            dlg.destroy()
++        except Exception:
++            pass
++
++    def _cancel() -> None:
++        result["value"] = None
++        try:
++            dlg.destroy()
++        except Exception:
++            pass
++
++    tree.bind("<Double-1>", lambda _e: _accept())
++
++    # Buttons
++    btns = ttk.Frame(dlg)
++    btns.pack(fill=tk.X, padx=10, pady=10)
++    ttk.Button(btns, text="Übernehmen", command=_accept).pack(side=tk.LEFT)
++    ttk.Button(btns, text="Abbrechen", command=_cancel).pack(side=tk.RIGHT)
++
++    term_var.trace_add("write", _schedule_refresh)
++    root_cb.bind("<<ComboboxSelected>>", lambda _e: _schedule_refresh())
++
++    # Initial fill
++    _populate()
++    try:
++        term_entry.focus_set()
++        term_entry.icursor(tk.END)
++    except Exception:
++        pass
++
++    dlg.wait_window()
++    return result["value"]
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_move.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_move.py
+@@ -13,7 +13,7 @@
+ from jfo.infra.journal import append_journal
+ from jfo.infra.index_update import apply_plan_to_index
+ from jfo.infra.sqlite_index import files_under_dir_recursive
+-from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, ask_execute_with_dry_run
++from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, ask_execute_with_dry_run, pick_from_analysis_index
+ from jfo.ui.widgets import LabeledEntry, ReadonlyText, LogText, PlanTable
+ 
+ 
+@@ -33,6 +33,7 @@
+         self.src_entry = LabeledEntry(src_row, "Quelle (remote dir):", width=80)
+         self.src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(src_row, text="Browse…", command=lambda: self._browse_into(self.src_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(src_row, text="Suche…", command=lambda: self._search_into(self.src_entry)).pack(side=tk.LEFT, padx=6)
+ 
+         dst_row = ttk.Frame(in_frm)
+         dst_row.pack(fill=tk.X, pady=2)
+@@ -40,6 +41,7 @@
+         self.dst_entry = LabeledEntry(dst_row, "Ziel (remote dir):", width=80)
+         self.dst_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(dst_row, text="Browse…", command=lambda: self._browse_into(self.dst_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(dst_row, text="Suche…", command=lambda: self._search_into(self.dst_entry)).pack(side=tk.LEFT, padx=6)
+ 
+         opt = ttk.Frame(in_frm)
+         opt.pack(fill=tk.X, pady=(6, 2))
+@@ -83,6 +85,18 @@
+         self.exec_btn = ttk.Button(opt, text="Ausführen", command=self._execute)
+         self.exec_btn.pack(side=tk.LEFT, padx=6)
+ 
++    def _search_into(self, entry: LabeledEntry) -> None:
++        """Fill an entry by searching in the local analysis index (SQLite)."""
++        # Suggest initial term from the last path segment
++        current = entry.get().strip()
++        try:
++            initial = PurePosixPath(current).name if current else ""
++        except Exception:
++            initial = ""
++        chosen = pick_from_analysis_index(self, title="Aus Analyse auswählen", mode="dir", initial_term=initial)
++        if chosen:
++            entry.set(chosen)
++
+     def _browse_into(self, entry: LabeledEntry) -> None:
+         if not self.app.ssh.is_connected():
+             messagebox.showerror("SSH", "Nicht verbunden. (Tab Main)", parent=self)
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_swap.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_swap.py
+@@ -37,7 +37,7 @@
+ from jfo.infra.index_update import apply_plan_to_index
+ from jfo.core.validators import Sandbox, SandboxViolation
+ from jfo.ui.widgets import LabeledEntry, ReadonlyText, LogText, PlanTable
+-from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, ask_execute_with_dry_run
++from jfo.ui.dialogs import ask_text_confirm, pick_remote_directory, ask_execute_with_dry_run, pick_from_analysis_index
+ 
+ 
+ @dataclass
+@@ -66,6 +66,7 @@
+         self.a_entry = LabeledEntry(row_a, "Ordner A (remote):", width=80)
+         self.a_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(row_a, text="Browse…", command=lambda: self._browse_into(self.a_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(row_a, text="Suche…", command=lambda: self._search_into(self.a_entry)).pack(side=tk.LEFT, padx=6)
+ 
+         row_b = ttk.Frame(in_frm)
+         row_b.pack(fill=tk.X, pady=2)
+@@ -72,6 +73,7 @@
+         self.b_entry = LabeledEntry(row_b, "Ordner B (remote):", width=80)
+         self.b_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+         ttk.Button(row_b, text="Browse…", command=lambda: self._browse_into(self.b_entry)).pack(side=tk.LEFT, padx=6)
++        ttk.Button(row_b, text="Suche…", command=lambda: self._search_into(self.b_entry)).pack(side=tk.LEFT, padx=6)
+ 
+         hint = (
+             "Tipp: Wähle zwei falsch benannte Film-Ordner.\n"
+@@ -107,6 +109,18 @@
+         self._update_execute_label()
+         self._refresh_roots()
+ 
++    def _search_into(self, entry: LabeledEntry) -> None:
++        """Fill an entry by searching in the local analysis index (SQLite)."""
++        current = entry.get().strip()
++        try:
++            initial = PurePosixPath(current).name if current else ""
++        except Exception:
++            initial = ""
++        chosen = pick_from_analysis_index(self, title="Aus Analyse auswählen", mode="dir", initial_term=initial)
++        if chosen:
++            entry.set(chosen)
++
+     def _browse_into(self, entry: LabeledEntry, *, title: str = "Remote Ordner auswählen") -> None:
+         if not self.app.ssh.is_connected():
+             messagebox.showerror("SSH", "Nicht verbunden. (Tab Main)", parent=self)
+--- a/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_rename.py
++++ b/NAS-Desktop-SSH-Operator/src/jfo/ui/tabs/tab_rename.py
+@@ -158,6 +158,8 @@
+             variable=self.dry_run,
+             command=self._dry_run_changed,
+         ).pack(side=tk.LEFT)
++        self.mode_badge = ttk.Label(opt_frm, text="")
++        self.mode_badge.pack(side=tk.LEFT, padx=(10, 0))
+         ttk.Button(opt_frm, text="Vorausfüllen aus NFO", command=self._prefill_from_nfo).pack(side=tk.LEFT, padx=6)
+         ttk.Button(opt_frm, text="Gruppen laden", command=self._load_groups).pack(side=tk.LEFT, padx=6)
+         ttk.Button(opt_frm, text="Plan erstellen", command=self._build_plan).pack(side=tk.LEFT, padx=6)
+@@ -904,10 +906,14 @@
+     def _update_execute_label(self) -> None:
+         if not hasattr(self, "exec_btn"):
+             return
+         if bool(self.dry_run.get()):
+             self.exec_btn.config(text="Testlauf ausführen")
++            if getattr(self, "mode_badge", None) is not None:
++                self.mode_badge.config(text="MODUS: TESTLAUF (keine Änderungen)")
+         else:
+             self.exec_btn.config(text="Echt ausführen")
++            if getattr(self, "mode_badge", None) is not None:
++                self.mode_badge.config(text="MODUS: ECHTLAUF (ändert Dateien)")
+ 
+     def _execute(self) -> None:
+         if not self._plan or not self._plan.selected_operations():
+@@ -936,7 +942,10 @@
+                 return
+ 
+-        self.log.append_line("[local] executing script...")
++        # Always regenerate right before execution to reflect latest toggles.
++        self._regen_script()
++        self.log.append_line(f"[local] run mode: {'DRY-RUN' if bool(self.dry_run.get()) else 'REAL'}")
++        self.log.append_line("[local] executing script...")
+         t = threading.Thread(target=self._worker_exec, daemon=True)
+         t.start()
+--- a/NAS-Desktop-SSH-Operator/README.md
++++ b/NAS-Desktop-SSH-Operator/README.md
+@@ -166,6 +166,7 @@
+ ### Tab 4: Verschieben
+ 
+ - Quelle und Ziel (remote)
++- **Suche… (aus Analyse-Index)**: tippe einen Teil des Namens und übernimm den exakten Ordnerpfad (verhindert Tippfehler)
+ - Optionen: Skip wenn Ziel existiert / Suffix-Strategie
+ - Plan erstellt `mv`-Operationen
+ - Ausführen führt Script aus
+@@ -204,6 +205,23 @@
+   - Quelle/Ziel auf gleichem Dateisystem (Device-ID via `stat`)
+ 
++### Tab 7: History / Undo
++
++- Zeigt die zuletzt ausgeführten Runs (Journal)
++- Ein Run kann als Script wiederhergestellt werden:
++  - **Undo** (Rollback): erstellt ein Gegen-Script (mv zurück / rename zurück / ln entfernen)
++  - Optional: nur anzeigen (Plan/Preview), dann ausführen
++
++### Tab 8: Tauschen (2 Ordner)
++
++- Für den Sonderfall: **Film A und Film B haben die falschen Ordnernamen**
++- Wähle Ordner A und Ordner B (Browse oder **Suche…** aus dem Analyse-Index)
++- JFO plant einen sicheren 3‑Step‑Swap (A→TEMP, B→A, TEMP→B)
++- Optional: Dateien im Inneren mit-umbenennen (Sidecars bleiben konsistent)
++
+ ---
+ 
+ ## Sicherheit / Guardrails (Wichtig)
+@@ -207,7 +225,9 @@
+ 
+-- **Dry-Run**: Standard `DRY_RUN=1` → Script schreibt nur vor, führt aber nicht aus.
++- **Dry-Run / Testlauf**: Standard `DRY_RUN=1` → Script schreibt nur vor (Log zeigt `DRY:`), führt aber nicht aus.
++  - Beim Klick auf **Ausführen** im Testlauf fragt JFO nochmal: **Testlauf starten** oder **Echt ausführen**.
+ - **No Overwrite**: existierende Ziele werden standardmäßig als Fehler behandelt.
+ - **Root-Sandbox**: jede Operation muss innerhalb der konfigurierten Roots liegen.
+ - **Mass-Confirm**: ab `N` Operationen muss zusätzlich "JA" getippt werden.
+@@ -220,3 +240,17 @@
+ ```bash
+ pytest -q
