@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jellyfin-organizer"
+version = "0.1.0"
+description = "Plan-first NAS organizer for Jellyfin (GUI + SSH script generation)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "You"}]
+dependencies = [
+  "paramiko>=3.5,<5",
+  "cryptography>=41,<47",
+  "platformdirs>=4,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+jfo = "jfo.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

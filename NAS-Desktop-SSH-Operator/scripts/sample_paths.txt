@@ -1,0 +1,4 @@
+# Beispiel: jede Zeile ein relativer Ordnerpfad
+Shows/Breaking Bad/Season 01
+Shows/Breaking Bad/Season 02
+Movies/A01_Marvel_(MCU_&*sonstige_Marvelfilme)
